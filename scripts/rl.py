@@ -1,12 +1,35 @@
 import json
+import importlib.util
 import os
-from typing import Optional, Tuple, List
+import sys
+from typing import Optional, Tuple, List, Union
 from datetime import datetime
 from pathlib import Path
 from openai import OpenAI
 import fire
 
+class _FilteredStderr:
+    def __init__(self, wrapped):
+        self._wrapped = wrapped
+
+    def write(self, data):
+        if isinstance(data, str) and "Gym has been unmaintained since 2022" in data:
+            return len(data)
+        return self._wrapped.write(data)
+
+    def flush(self):
+        return self._wrapped.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._wrapped, name)
+
+
+if os.environ.get("ALPHAGEN_HIDE_GYM_NOTICE", "1") == "1":
+    sys.stderr = _FilteredStderr(sys.stderr)
+
+
 import numpy as np
+import torch
 from sb3_contrib.ppo_mask import MaskablePPO
 from stable_baselines3.common.callbacks import BaseCallback
 
@@ -18,10 +41,17 @@ from alphagen.rl.policy import LSTMSharedNet
 from alphagen.utils import reseed_everything, get_logger
 from alphagen.rl.env.core import AlphaEnvCore
 from alphagen_qlib.calculator import QLibStockDataCalculator
-from alphagen_qlib.stock_data import initialize_qlib
+from alphagen_qlib.stock_data import initialize_qlib, StockData
 from alphagen_llm.client import ChatClient, OpenAIClient, ChatConfig
 from alphagen_llm.prompts.system_prompt import EXPLAIN_WITH_TEXT_DESC
 from alphagen_llm.prompts.interaction import InterativeSession, DefaultInteraction
+
+
+def _resolve_tensorboard_log_dir(path: str) -> Optional[str]:
+    if importlib.util.find_spec("tensorboard") is None:
+        print("[Main] tensorboard is not installed, disabling TensorBoard logging.")
+        return None
+    return path
 
 
 def read_alphagpt_init_pool(seed: int) -> List[Expression]:
@@ -157,21 +187,53 @@ class CustomCallback(BaseCallback):
 
 def run_single_experiment(
     seed: int = 0,
+    qlib_dir: str = "~/.qlib/qlib_data/cn_data",
+    qlib_kernels: Optional[int] = None,
+    device: str = "cuda:0",
     instruments: str = "csi300",
-    pool_capacity: int = 10,
-    steps: int = 200_000,
+    pool_capacity: int = 50,
+    steps: int = 500_000,
     alphagpt_init: bool = False,
     use_llm: bool = False,
     llm_every_n_steps: int = 25_000,
     drop_rl_n: int = 5,
-    llm_replace_n: int = 3
+    llm_replace_n: int = 3,
+    ppo_n_steps: int = 8192,
+    ppo_batch_size: int = 1024,
+    ppo_n_epochs: int = 10,
+    learning_rate: float = 3e-4,
+    lstm_layers: int = 3,
+    d_model: int = 256,
+    dropout: float = 0.1,
+    progress_bar: bool = True,
+    print_expr: bool = False,
 ):
     reseed_everything(seed)
-    initialize_qlib("~/.qlib/qlib_data/cn_data")
+    qlib_dir = os.path.expanduser(qlib_dir)
+    if qlib_kernels is None:
+        qlib_kernels = 1 if os.name == "nt" else 8
+    initialize_qlib(qlib_dir, kernels=qlib_kernels)
+
+    if ppo_n_steps <= 0:
+        raise ValueError("ppo_n_steps must be greater than 0.")
+    if ppo_batch_size <= 0:
+        raise ValueError("ppo_batch_size must be greater than 0.")
+    if ppo_n_epochs <= 0:
+        raise ValueError("ppo_n_epochs must be greater than 0.")
+    if ppo_n_steps % ppo_batch_size != 0:
+        raise ValueError("ppo_batch_size must divide ppo_n_steps when using a single environment.")
+
+    device_obj = torch.device(device)
+    if device_obj.type == "cuda":
+        torch.backends.cudnn.benchmark = True
 
     llm_replace_n = 0 if not use_llm else llm_replace_n
+    tensorboard_log_dir = _resolve_tensorboard_log_dir("./out/tensorboard")
     print(f"""[Main] Starting training process
     Seed: {seed}
+    Qlib dir: {qlib_dir}
+    Qlib kernels: {qlib_kernels}
+    Device: {device_obj}
     Instruments: {instruments}
     Pool capacity: {pool_capacity}
     Total Iteration Steps: {steps}
@@ -179,7 +241,16 @@ def run_single_experiment(
     Use LLM: {use_llm}
     Invoke LLM every N steps: {llm_every_n_steps}
     Replace N alphas with LLM: {llm_replace_n}
-    Drop N alphas before LLM: {drop_rl_n}""")
+    Drop N alphas before LLM: {drop_rl_n}
+    PPO n_steps: {ppo_n_steps}
+    PPO batch size: {ppo_batch_size}
+    PPO n_epochs: {ppo_n_epochs}
+    Learning rate: {learning_rate}
+    LSTM layers: {lstm_layers}
+    D model: {d_model}
+    Dropout: {dropout}
+    Progress bar: {progress_bar}
+    TensorBoard log dir: {tensorboard_log_dir}""")
 
     timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
     # tag = "rlv2" if llm_add_subexpr == 0 else f"afs{llm_add_subexpr}aar1-5"
@@ -191,7 +262,6 @@ def run_single_experiment(
     save_path = os.path.join("./out/results", name_prefix)
     os.makedirs(save_path, exist_ok=True)
 
-    device = torch.device("cuda:0")
     close = Feature(FeatureType.CLOSE)
     target = Ref(close, -20) / close - 1
 
@@ -200,7 +270,7 @@ def run_single_experiment(
             instrument=instruments,
             start_time=start,
             end_time=end,
-            device=device
+            device=device_obj
         )
 
     segments = [
@@ -209,8 +279,21 @@ def run_single_experiment(
         ("2022-07-01", "2022-12-31"),
         ("2023-01-01", "2023-06-30")
     ]
-    datasets = [get_dataset(*s) for s in segments]
-    calculators = [QLibStockDataCalculator(d, target) for d in datasets]
+    datasets: List[StockData] = []
+    for idx, segment in enumerate(segments, start=1):
+        start, end = segment
+        print(f"[Main] Building dataset {idx}/{len(segments)}: {start} -> {end}")
+        dataset = get_dataset(start, end)
+        datasets.append(dataset)
+        print(
+            f"[Main] Dataset {idx}/{len(segments)} ready: "
+            f"n_days={dataset.n_days}, n_stocks={dataset.n_stocks}"
+        )
+
+    calculators: List[QLibStockDataCalculator] = []
+    for idx, dataset in enumerate(datasets, start=1):
+        print(f"[Main] Building calculator {idx}/{len(datasets)}")
+        calculators.append(QLibStockDataCalculator(dataset, target))
 
     def build_pool(exprs: List[Expression]) -> LinearAlphaPool:
         pool = MseAlphaPool(
@@ -218,7 +301,7 @@ def run_single_experiment(
             calculator=calculators[0],
             ic_lower_bound=None,
             l1_alpha=5e-3,
-            device=device
+            device=device_obj
         )
         if len(exprs) != 0:
             pool.force_load_exprs(exprs)
@@ -238,9 +321,10 @@ def run_single_experiment(
 
     env = AlphaEnv(
         pool=pool,
-        device=device,
-        print_expr=True
+        device=device_obj,
+        print_expr=print_expr
     )
+    print("[Main] Environment ready")
     checkpoint_callback = CustomCallback(
         save_path=save_path,
         test_calculators=calculators[1:],
@@ -255,38 +339,59 @@ def run_single_experiment(
         policy_kwargs=dict(
             features_extractor_class=LSTMSharedNet,
             features_extractor_kwargs=dict(
-                n_layers=2,
-                d_model=128,
-                dropout=0.1,
-                device=device,
+                n_layers=lstm_layers,
+                d_model=d_model,
+                dropout=dropout,
+                device=device_obj,
             ),
         ),
+        n_steps=ppo_n_steps,
         gamma=1.,
         ent_coef=0.01,
-        batch_size=128,
-        tensorboard_log="./out/tensorboard",
-        device=device,
+        n_epochs=ppo_n_epochs,
+        learning_rate=learning_rate,
+        batch_size=ppo_batch_size,
+        tensorboard_log=tensorboard_log_dir,
+        device=device_obj,
+        seed=seed,
         verbose=1,
     )
+    print("[Main] PPO model ready, starting learn()")
     model.learn(
         total_timesteps=steps,
         callback=checkpoint_callback,
         tb_log_name=name_prefix,
+        progress_bar=progress_bar,
     )
 
 
 def main(
     random_seeds: Union[int, Tuple[int]] = 0,
-    pool_capacity: int = 20,
+    qlib_dir: str = "~/.qlib/qlib_data/cn_data",
+    qlib_kernels: Optional[int] = None,
+    device: str = "cuda:0",
+    pool_capacity: int = 50,
     instruments: str = "csi300",
     alphagpt_init: bool = False,
     use_llm: bool = False,
     drop_rl_n: int = 10,
-    steps: Optional[int] = None,
-    llm_every_n_steps: int = 25000
+    steps: int = 500_000,
+    llm_every_n_steps: int = 25000,
+    ppo_n_steps: int = 8192,
+    ppo_batch_size: int = 1024,
+    ppo_n_epochs: int = 10,
+    learning_rate: float = 3e-4,
+    lstm_layers: int = 3,
+    d_model: int = 256,
+    dropout: float = 0.1,
+    progress_bar: bool = True,
+    print_expr: bool = False,
 ):
     """
     :param random_seeds: Random seeds
+    :param qlib_dir: Qlib data directory
+    :param qlib_kernels: Qlib feature-loading worker processes; defaults to 1 on Windows
+    :param device: Torch device string
     :param pool_capacity: Maximum size of the alpha pool
     :param instruments: Stock subset name
     :param alphagpt_init: Use an alpha set pre-generated by LLM as the initial pool
@@ -294,25 +399,32 @@ def main(
     :param drop_rl_n: Drop n worst alphas before invoke the LLM
     :param steps: Total iteration steps
     :param llm_every_n_steps: Invoke LLM every n steps
+    :param progress_bar: Show SB3 progress bar in terminal
     """
     if isinstance(random_seeds, int):
         random_seeds = (random_seeds, )
-    default_steps = {
-        10: 200_000,
-        20: 250_000,
-        50: 300_000,
-        100: 350_000
-    }
     for s in random_seeds:
         run_single_experiment(
             seed=s,
+            qlib_dir=qlib_dir,
+            qlib_kernels=qlib_kernels,
+            device=device,
             instruments=instruments,
             pool_capacity=pool_capacity,
-            steps=default_steps[int(pool_capacity)] if steps is None else int(steps),
+            steps=int(steps),
             alphagpt_init=alphagpt_init,
             drop_rl_n=drop_rl_n,
             use_llm=use_llm,
-            llm_every_n_steps=llm_every_n_steps
+            llm_every_n_steps=llm_every_n_steps,
+            ppo_n_steps=ppo_n_steps,
+            ppo_batch_size=ppo_batch_size,
+            ppo_n_epochs=ppo_n_epochs,
+            learning_rate=learning_rate,
+            lstm_layers=lstm_layers,
+            d_model=d_model,
+            dropout=dropout,
+            progress_bar=progress_bar,
+            print_expr=print_expr,
         )
 
 

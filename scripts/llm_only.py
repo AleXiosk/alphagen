@@ -2,6 +2,7 @@ from typing import Optional, List
 from logging import Logger
 from datetime import datetime
 import json
+import os
 from itertools import accumulate
 
 import fire
@@ -69,6 +70,9 @@ def run_experiment(
     pool_size: int = 20,
     n_replace: int = 3,
     n_updates: int = 20,
+    instruments: str = "csi300",
+    qlib_dir: str = "~/.qlib/qlib_data/cn_data",
+    device: str = "cuda:0",
     without_weights: bool = False,
     contextful: bool = False,
     prefix: Optional[str] = None,
@@ -88,11 +92,10 @@ def run_experiment(
 
     args = pprint_arguments()
 
-    initialize_qlib(f"~/.qlib/qlib_data/cn_data")
-    instruments = "csi300"
-    device = torch.device("cuda:0")
+    initialize_qlib(os.path.expanduser(qlib_dir))
+    device_obj = torch.device(device)
     timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-    prefix = str(prefix) + "-" if prefix is not None else ""
+    prefix = str(prefix) + "-" if prefix is not None else f"{instruments}-"
     out_path = f"./out/llm-tests/interaction/{prefix}{timestamp}"
     logger = get_logger(name="llm", file_path=f"{out_path}/llm.log")
 
@@ -103,9 +106,9 @@ def run_experiment(
         instrument=instruments,
         start_time="2012-01-01",
         end_time="2021-12-31",
-        device=device
+        device=device_obj
     )
-    data_test = build_test_data(instruments, device, n_half_years=3)
+    data_test = build_test_data(instruments, device_obj, n_half_years=3)
     calculator_train = QLibStockDataCalculator(data_train, target)
     calculator_test = [QLibStockDataCalculator(d, target) for _, d in data_test]
 
@@ -113,7 +116,7 @@ def run_experiment(
         pool = MseAlphaPool(
             capacity=max(pool_size, len(exprs)),
             calculator=calculator_train,
-            device=device
+            device=device_obj
         )
         pool.force_load_exprs(exprs)
         return pool

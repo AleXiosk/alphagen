@@ -18,10 +18,19 @@ _DEFAULT_QLIB_DATA_PATH = "~/.qlib/qlib_data/cn_data"
 _QLIB_INITIALIZED = False
 
 
-def initialize_qlib(qlib_data_path: str = _DEFAULT_QLIB_DATA_PATH) -> None:
+def initialize_qlib(
+    qlib_data_path: str = _DEFAULT_QLIB_DATA_PATH,
+    kernels: Optional[int] = None,
+    joblib_backend: Optional[str] = None,
+) -> None:
     import qlib
     from qlib.config import REG_CN
-    qlib.init(provider_uri=qlib_data_path, region=REG_CN)
+    init_kwargs = dict(provider_uri=qlib_data_path, region=REG_CN)
+    if kernels is not None:
+        init_kwargs["kernels"] = kernels
+    if joblib_backend is not None:
+        init_kwargs["joblib_backend"] = joblib_backend
+    qlib.init(**init_kwargs)
     global _QLIB_INITIALIZED
     _QLIB_INITIALIZED = True
 

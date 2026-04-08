@@ -1,4 +1,5 @@
-from typing import Optional, TypeVar, Callable, Optional, Tuple
+from typing import Callable, Optional, Tuple, TypeVar
+import argparse
 import os
 import pickle
 import warnings
@@ -19,6 +20,7 @@ from alphagen_generic.features import *
 from alphagen_qlib.stock_data import StockData, initialize_qlib
 from alphagen_qlib.calculator import QLibStockDataCalculator
 from alphagen_qlib.utils import load_alpha_pool_by_path
+from alphagen_qlib.universe import get_universe_spec
 
 
 _T = TypeVar("_T")
@@ -147,11 +149,31 @@ class QlibBacktest:
         )
 
 
+def benchmark_for_instrument(instrument: str) -> str:
+    spec = get_universe_spec(instrument)
+    return spec.benchmark if spec is not None else "SH000300"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run local AlphaGen backtest examples.")
+    parser.add_argument("--instrument", default="csi300", help="Instrument universe name, e.g. csi300 or csi500.")
+    parser.add_argument("--benchmark", default=None, help="Benchmark code. Defaults inferred from instrument.")
+    parser.add_argument("--qlib-dir", default="~/.qlib/qlib_data/cn_data", help="Qlib data directory.")
+    parser.add_argument("--top-k", type=int, default=50, help="Top-K positions.")
+    parser.add_argument("--n-drop", type=int, default=5, help="Daily drop count.")
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    initialize_qlib("~/.qlib/qlib_data/cn_data")
-    qlib_backtest = QlibBacktest(top_k=50, n_drop=5)
+    args = parse_args()
+    initialize_qlib(os.path.expanduser(args.qlib_dir))
+    qlib_backtest = QlibBacktest(
+        benchmark=args.benchmark or benchmark_for_instrument(args.instrument),
+        top_k=args.top_k,
+        n_drop=args.n_drop,
+    )
     data = StockData(
-        instrument="csi300",
+        instrument=args.instrument,
         start_time="2022-01-01",
         end_time="2023-06-30"
     )
@@ -161,17 +183,18 @@ if __name__ == "__main__":
         df = data.make_dataframe(calc.make_ensemble_alpha(exprs, weights))
         qlib_backtest.run(df, output_prefix=f"out/backtests/50-5/{prefix}/{seed}")
 
-    for p in Path("out/gp").iterdir():
+    gp_root = Path("out/gp") / args.instrument
+    for p in gp_root.iterdir() if gp_root.exists() else []:
         seed = int(p.name)
         with open(p / "40.json") as f:
             report = json.load(f)
         state = report["res"]["res"]["pool_state"]
-        run_backtest("gp", seed, [parse_expression(e) for e in state["exprs"]], state["weights"])
+        run_backtest(f"gp-{args.instrument}", seed, [parse_expression(e) for e in state["exprs"]], state["weights"])
     exit(0)
     for p in Path("out/results").iterdir():
         inst, size, seed, time, ver = p.name.split('_', 4)
         size, seed = int(size), int(seed)
-        if inst != "csi300" or size != 20 or time < "20240923" or ver == "llm_d5":
+        if inst != args.instrument or size != 20 or time < "20240923" or ver == "llm_d5":
             continue
         exprs, weights = load_alpha_pool_by_path(str(p / "251904_steps_pool.json"))
         run_backtest(ver, seed, exprs, weights)

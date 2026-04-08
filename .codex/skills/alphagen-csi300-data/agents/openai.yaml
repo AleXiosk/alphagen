@@ -1,0 +1,4 @@
+interface:
+  display_name: "AlphaGen CSI300 Data"
+  short_description: "Project workflow for CSI300 constituent history and data prep"
+  default_prompt: "Use $alphagen-csi300-data for this AlphaGen CSI300 task, especially historical index constituent extraction, interval generation, and data prep."

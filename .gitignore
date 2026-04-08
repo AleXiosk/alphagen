@@ -6,8 +6,10 @@ playground*.ipynb
 playground*.py
 /data/
 /out/
+/outputs/
 logs/
 tb_logs/
+/*.dmp
 get_baostock_data.ipynb
 get_baostock_data.py
 /utils/

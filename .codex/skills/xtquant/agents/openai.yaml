@@ -1,0 +1,4 @@
+interface:
+  display_name: "XtQuant"
+  short_description: "ThinkTrader/QMT xtquant docs and workflows"
+  default_prompt: "Use $xtquant to answer this xtquant/QMT/ThinkTrader task with local references and exact version dates."
